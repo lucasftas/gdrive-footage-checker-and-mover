@@ -9,32 +9,80 @@ from datetime import datetime
 from collections import defaultdict
 
 
-def _send_to_trash(path_str: str) -> bool:
-    """Envia arquivo para a Lixeira do Windows via SHFileOperationW."""
+def _send_to_trash(paths) -> bool:
+    """
+    Envia arquivo(s) para a Lixeira do Windows via SHFileOperationW.
+    'paths' pode ser um Path/str único ou uma lista deles.
+    Usa uma única chamada batch — o Windows exibe seu próprio dialog de progresso.
+    """
+    if isinstance(paths, (str, Path)):
+        paths = [paths]
+    if not paths:
+        return True
 
     class SHFILEOPSTRUCTW(ctypes.Structure):
         _fields_ = [
             ("hwnd",                  ctypes.wintypes.HWND),
             ("wFunc",                 ctypes.wintypes.UINT),
-            ("pFrom",                 ctypes.wintypes.LPCWSTR),
-            ("pTo",                   ctypes.wintypes.LPCWSTR),
+            ("pFrom",                 ctypes.c_void_p),   # ponteiro bruto p/ suportar multi-null
+            ("pTo",                   ctypes.c_void_p),
             ("fFlags",                ctypes.wintypes.WORD),
             ("fAnyOperationsAborted", ctypes.wintypes.BOOL),
             ("hNameMappings",         ctypes.c_void_p),
-            ("lpszProgressTitle",     ctypes.wintypes.LPCWSTR),
+            ("lpszProgressTitle",     ctypes.c_void_p),
         ]
 
-    FO_DELETE        = 0x0003
-    FOF_ALLOWUNDO    = 0x0040  # Envia pra lixeira (recuperavel)
-    FOF_NOCONFIRM    = 0x0010  # Sem dialogo de confirmacao do Windows
-    FOF_SILENT       = 0x0004  # Sem barra de progresso do Windows
+    FO_DELETE     = 0x0003
+    FOF_ALLOWUNDO = 0x0040   # Envia pra lixeira (recuperavel)
+    FOF_NOCONFIRM = 0x0010   # Sem "tem certeza?" do Windows
+    # FOF_SILENT  = 0x0004   # REMOVIDO — Windows mostra o dialog de progresso nativo
 
-    op         = SHFILEOPSTRUCTW()
-    op.wFunc   = FO_DELETE
-    op.pFrom   = path_str + "\0"  # Double-null terminated
-    op.fFlags  = FOF_ALLOWUNDO | FOF_NOCONFIRM | FOF_SILENT
+    # pFrom: caminhos separados por \0, terminados com \0\0
+    from_str = '\0'.join(str(p) for p in paths) + '\0\0'
+    from_buf  = ctypes.create_unicode_buffer(from_str, len(from_str))
+
+    op        = SHFILEOPSTRUCTW()
+    op.wFunc  = FO_DELETE
+    op.pFrom  = ctypes.addressof(from_buf)
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRM
 
     return ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op)) == 0
+
+
+def _try_move(src_str: str, dst_str: str,
+             max_retries: int = 3, retry_delay: float = 2.0):
+    """
+    Tenta mover um arquivo com retry automático.
+    - Erro 17 (cross-device): usa shutil como fallback
+    - Erro 32 (sharing violation) ou 5 (access denied): aguarda e tenta novamente
+    Retorna (True, info_str | None) em sucesso ou (False, erro_str) em falha.
+    """
+    import shutil, time
+    RETRY_ON = {32, 5}   # sharing violation, access denied
+    err_code, err_msg = 0, ""
+
+    for attempt in range(1, max_retries + 1):
+        if ctypes.windll.kernel32.MoveFileW(src_str, dst_str):
+            return True, None
+
+        err_code = ctypes.windll.kernel32.GetLastError()
+        err_msg  = ctypes.FormatError(err_code)
+
+        if err_code == 17:   # ERROR_NOT_SAME_DEVICE — copia e deleta
+            try:
+                shutil.move(src_str, dst_str)
+                return True, "cross-device"
+            except Exception as ex:
+                return False, f"[shutil fallback] {ex}"
+
+        if err_code in RETRY_ON and attempt < max_retries:
+            time.sleep(retry_delay)
+            continue           # próxima tentativa
+
+        break  # erro não-recuóperável ou esgotadas as tentativas
+
+    suffix = f" (após {max_retries} tentativas)" if err_code in RETRY_ON else ""
+    return False, f"[{err_code}] {err_msg}{suffix}"
 
 MONTHS_PT = {
     1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril",
@@ -59,6 +107,59 @@ FX3_CLEANUP_EXTENSIONS = {
     '.ppl',   # Playlist
     '.edl',   # Edit decision list
 }
+
+# Extensões de foto suportadas (A7IV)
+PHOTO_EXTENSIONS = {'.arw', '.jpg', '.jpeg', '.tiff', '.heic', '.png'}
+
+
+def _read_exif_datetime(path_obj) -> str | None:
+    """
+    Lê o campo DateTimeOriginal do EXIF de um JPEG sem nenhuma dependência.
+    Lê apenas os primeiros 64 KB do arquivo — muito rápido.
+    Retorna string 'YYYY:MM:DD HH:MM:SS' ou None.
+    """
+    if path_obj.suffix.lower() not in ('.jpg', '.jpeg'):
+        return None
+    try:
+        import struct
+        with open(path_obj, 'rb') as f:
+            data = f.read(65536)
+
+        pos = data.find(b'Exif\x00\x00')
+        if pos == -1:
+            return None
+
+        tiff = pos + 6
+        bo   = data[tiff:tiff + 2]
+        end  = '<' if bo == b'II' else '>' if bo == b'MM' else None
+        if not end:
+            return None
+
+        ifd0 = tiff + struct.unpack(end + 'I', data[tiff + 4:tiff + 8])[0]
+
+        def find_tag(ifd_pos, tag_id, depth=0):
+            if depth > 3 or ifd_pos + 2 > len(data):
+                return None
+            n = struct.unpack(end + 'H', data[ifd_pos:ifd_pos + 2])[0]
+            for i in range(min(n, 128)):
+                ep  = ifd_pos + 2 + i * 12
+                if ep + 12 > len(data):
+                    break
+                tag = struct.unpack(end + 'H', data[ep:ep + 2])[0]
+                if tag == tag_id:
+                    off = struct.unpack(end + 'I', data[ep + 8:ep + 12])[0]
+                    return data[tiff + off:tiff + off + 19].decode('ascii', errors='ignore').strip()
+                elif tag == 0x8769:  # ExifIFD pointer
+                    off = struct.unpack(end + 'I', data[ep + 8:ep + 12])[0]
+                    r   = find_tag(tiff + off, tag_id, depth + 1)
+                    if r:
+                        return r
+            return None
+
+        return find_tag(ifd0, 0x9003)  # DateTimeOriginal
+    except Exception:
+        return None
+
 
 class DriveOrganizerApp:
     def __init__(self, root):
@@ -141,7 +242,11 @@ class DriveOrganizerApp:
 
         tk.Button(frame_actions, text="🧹 Limpar FX3",
                   command=self.open_cleanup_window,
-                  width=13, bg="#6f42c1", fg="white", font=("Arial", 10, "bold")).pack(side="left")
+                  width=13, bg="#6f42c1", fg="white", font=("Arial", 10, "bold")).pack(side="left", padx=(0, 8))
+
+        tk.Button(frame_actions, text="📷 Fotos A7IV",
+                  command=self.open_photo_compare_window,
+                  width=13, bg="#0077b6", fg="white", font=("Arial", 10, "bold")).pack(side="left")
 
         # --- Status ---
         self.status_label = tk.Label(
@@ -428,19 +533,25 @@ class DriveOrganizerApp:
             self.update_status("Indexando Drive...", "#0078D7")
 
             drive_index = {}
+            drive_skipped = 0
             for item in drive_path.rglob('*'):
                 if self._stop_event.is_set():
                     break
                 if item.is_file() and item.suffix.lower() == '.mp4':
                     self.update_status(f"Indexando Drive: {item.name}", "#0078D7")
-                    key = self._get_file_key(item, mode_index)
-                    drive_index.setdefault(key, []).append(item)
+                    try:
+                        key = self._get_file_key(item, mode_index)
+                        drive_index.setdefault(key, []).append(item)
+                    except Exception as e:
+                        drive_skipped += 1
+                        self.log(f"  ⚠ Pulado (Drive): {item.name} — {e}")
 
             if self._stop_event.is_set():
                 self._set_analysis_running(False)
                 return
 
-            self.log(f"Total de .mp4 indexados no Drive: {len(drive_index)}")
+            self.log(f"Total de .mp4 indexados no Drive: {len(drive_index)}" +
+                     (f"  ({drive_skipped} pulado(s) por erro)" if drive_skipped else ""))
             self.log("")
 
             # ---------------------------------------------------
@@ -453,12 +564,18 @@ class DriveOrganizerApp:
 
             matched_files   = []
             unmatched_files = []
+            local_skipped   = 0
 
             for item in local_files:
                 if self._stop_event.is_set():
                     break
                 self.update_status(f"Verificando: {item.name}", "#FF8C00")
-                key = self._get_file_key(item, mode_index)
+                try:
+                    key = self._get_file_key(item, mode_index)
+                except Exception as e:
+                    local_skipped += 1
+                    self.log(f"  ⚠ Pulado (Local): {item.name} — {e}")
+                    continue
 
                 if key in drive_index:
                     matched_drive_item = drive_index[key][0]
@@ -469,6 +586,9 @@ class DriveOrganizerApp:
                     matched_files.append(item)
                 else:
                     unmatched_files.append(item)
+
+            if local_skipped:
+                self.log(f"  ⚠ Arquivos pulados por erro de acesso: {local_skipped}")
 
             self.log(f"  ✓ Com correspondência no Drive:  {len(matched_files):>4} → prontos para mover")
             self.log(f"  ✗ SEM correspondência no Drive:  {len(unmatched_files):>4}")
@@ -507,6 +627,352 @@ class DriveOrganizerApp:
             self.update_status(f"Erro na análise: {str(e)}", "red")
             self.log(f"ERRO: {str(e)}")
             self._set_analysis_running(False)
+
+    # ================================================================
+    # Comparação de Fotos — Sony A7IV
+    # ================================================================
+
+    def open_photo_compare_window(self):
+        """Janela de comparação de fotos A7IV: ARW por tamanho, JPG por tamanho+EXIF."""
+        win = tk.Toplevel(self.root)
+        win.title("📷 Comparação de Fotos — Sony A7IV")
+        win.resizable(True, True)
+
+        self.root.update_idletasks()
+        mx = self.root.winfo_x()
+        my = self.root.winfo_y()
+        mw = self.root.winfo_width()
+        win.geometry(f"960x720+{mx + mw + 8}+{my}")
+
+        # Estado interno da janela
+        _pending   = []
+        _stop_evt  = threading.Event()
+
+        # ── Cabeçalho ──────────────────────────────────────────────
+        hdr = tk.Frame(win, bg="#0077b6", pady=8)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="📷  Comparação de Fotos — Sony A7IV",
+                 font=("Arial", 11, "bold"), fg="white", bg="#0077b6").pack(padx=14, anchor="w")
+        tk.Label(hdr, text="ARW → tamanho exato  |  JPG/JPEG → tamanho + Data EXIF  |  Nomes ignorados",
+                 font=("Arial", 9), fg="#90e0ef", bg="#0077b6").pack(padx=14, anchor="w")
+
+        # ── Pastas (herda valores do app principal) ─────────────────
+        def _row(parent, label, var):
+            tk.Label(parent, text=label, font=("Arial", 10, "bold")).pack(anchor="w", padx=12, pady=(6, 0))
+            f = tk.Frame(parent)
+            f.pack(fill="x", padx=12)
+            tk.Entry(f, textvariable=var, font=("Arial", 10)).pack(side="left", fill="x", expand=True)
+            tk.Button(f, text="Procurar",
+                      command=lambda v=var: self.select_folder(v)).pack(side="right", padx=(8, 0))
+
+        p_local_var  = tk.StringVar(value=self.local_var.get())
+        p_drive_var  = tk.StringVar(value=self.drive_var.get())
+        p_mirror_var = tk.StringVar(value=self.mirror_var.get())
+
+        _row(win, "Pasta Local (fotos a verificar):",           p_local_var)
+        _row(win, "Referência no Drive (fotos já enviadas):",   p_drive_var)
+        _row(win, "Pasta Destino (para onde mover matches):",   p_mirror_var)
+
+        # ── Extensões ──────────────────────────────────────────────
+        ext_frame = tk.Frame(win)
+        ext_frame.pack(fill="x", padx=12, pady=(8, 0))
+        tk.Label(ext_frame, text="Extensões:", font=("Arial", 10, "bold")).pack(side="left")
+        ext_vars = {}
+        for ext in ['.ARW', '.JPG', '.JPEG', '.TIFF', '.HEIC', '.PNG']:
+            v = tk.BooleanVar(value=ext in ('.ARW', '.JPG', '.JPEG'))
+            ext_vars[ext.lower()] = v
+            tk.Checkbutton(ext_frame, text=ext, variable=v,
+                           font=("Arial", 10)).pack(side="left", padx=6)
+
+        # ── Botões de ação ─────────────────────────────────────────
+        ba = tk.Frame(win)
+        ba.pack(fill="x", padx=12, pady=8)
+
+        btn_analyze = tk.Button(ba, text="1. Analisar", width=14,
+                                font=("Arial", 10, "bold"))
+        btn_analyze.pack(side="left", padx=(0, 8))
+
+        btn_move = tk.Button(ba, text="2. Mover Fotos", width=14,
+                             bg="#28a745", fg="white", font=("Arial", 10, "bold"),
+                             state="disabled")
+        btn_move.pack(side="left", padx=(0, 8))
+
+        btn_stop = tk.Button(ba, text="⛔ Interromper", width=14,
+                             bg="#dc3545", fg="white", font=("Arial", 10, "bold"),
+                             state="disabled")
+        btn_stop.pack(side="left")
+
+        # ── Status ─────────────────────────────────────────────────
+        status_var = tk.StringVar(value="Aguardando análise...")
+        status_lbl = tk.Label(win, textvariable=status_var,
+                              font=("Arial", 10), bg="#e9ecef", fg="#333",
+                              anchor="w", padx=10, relief="flat")
+        status_lbl.pack(fill="x", padx=12, pady=(0, 4), ipady=4)
+
+        # ── Log ────────────────────────────────────────────────────
+        log_frame = tk.Frame(win, bd=1, relief="solid")
+        log_frame.pack(fill="x", padx=12, pady=(0, 4))
+        log_text = tk.Text(log_frame, height=7, font=("Courier New", 9),
+                           bg="#1e1e1e", fg="#d4d4d4", wrap="none",
+                           state="disabled", relief="flat")
+        log_sy = ttk.Scrollbar(log_frame, orient="vertical", command=log_text.yview)
+        log_sx = ttk.Scrollbar(log_frame, orient="horizontal", command=log_text.xview)
+        log_text.configure(yscrollcommand=log_sy.set, xscrollcommand=log_sx.set)
+        log_text.tag_configure("hdr",  foreground="#569cd6", font=("Courier New", 9, "bold"))
+        log_text.tag_configure("ok",   foreground="#4ec9b0")
+        log_text.tag_configure("warn", foreground="#ce9178")
+        log_text.tag_configure("err",  foreground="#f44747")
+        log_sy.pack(side="right", fill="y")
+        log_sx.pack(side="bottom", fill="x")
+        log_text.pack(fill="both", expand=False)
+
+        def _log(text, tag=None):
+            def _do():
+                log_text.config(state="normal")
+                if tag:
+                    log_text.insert(tk.END, text + "\n", tag)
+                else:
+                    log_text.insert(tk.END, text + "\n")
+                log_text.see(tk.END)
+                log_text.config(state="disabled")
+            win.after(0, _do)
+
+        def _clear_log():
+            log_text.config(state="normal")
+            log_text.delete("1.0", tk.END)
+            log_text.config(state="disabled")
+
+        # ── Tabela de resultados ───────────────────────────────────
+        tree_frame = tk.Frame(win)
+        tree_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        tk.Label(tree_frame, text="Fotos com correspondência no Drive (serão movidas):",
+                 font=("Arial", 9, "bold"), fg="#555").pack(anchor="w")
+
+        tbl = tk.Frame(tree_frame)
+        tbl.pack(fill="both", expand=True)
+        tree = ttk.Treeview(tbl, columns=("local", "dest"), show="headings", selectmode="none")
+        tree.heading("local", text="Caminho Original (Local)")
+        tree.heading("dest",  text="Destino (Estrutura do Drive)")
+        tree.column("local", width=450, anchor="w")
+        tree.column("dest",  width=450, anchor="w")
+        sy2 = ttk.Scrollbar(tbl, orient="vertical",   command=tree.yview)
+        sx2 = ttk.Scrollbar(tbl, orient="horizontal",  command=tree.xview)
+        tree.configure(yscrollcommand=sy2.set, xscrollcommand=sx2.set)
+        sy2.pack(side="right", fill="y")
+        sx2.pack(side="bottom", fill="x")
+        tree.pack(side="left", fill="both", expand=True)
+
+        # ── Funções de key por extensão ────────────────────────────
+        def _photo_key(path_obj):
+            size = path_obj.stat().st_size
+            ext  = path_obj.suffix.lower()
+            if ext in ('.jpg', '.jpeg'):
+                exif_dt = _read_exif_datetime(path_obj)
+                return (size, exif_dt) if exif_dt else (size,)
+            # ARW e demais: tamanho apenas
+            return (size,)
+
+        # ── Análise ────────────────────────────────────────────────
+        def _run_analysis():
+            local_dir  = p_local_var.get()
+            drive_dir  = p_drive_var.get()
+            mirror_dir = p_mirror_var.get()
+
+            selected_exts = {ext for ext, var in ext_vars.items() if var.get()}
+            if not selected_exts:
+                status_var.set("Selecione ao menos uma extensão.")
+                return
+
+            _pending.clear()
+            _stop_evt.clear()
+            for item in tree.get_children():
+                tree.delete(item)
+            win.after(0, _clear_log)
+
+            btn_analyze.config(state="disabled")
+            btn_move.config(state="disabled")
+            btn_stop.config(state="normal")
+            status_var.set("Iniciando análise...")
+
+            def _thread():
+                try:
+                    local_path  = Path(local_dir)
+                    drive_path  = Path(drive_dir)
+                    mirror_path = Path(mirror_dir)
+
+                    # ETAPA 1 — inventário local
+                    _log("=" * 62, "hdr")
+                    _log("ETAPA 1 — Inventário local", "hdr")
+                    _log("=" * 62, "hdr")
+                    win.after(0, lambda: status_var.set("Lendo pasta local..."))
+
+                    local_files = []
+                    for item in local_path.rglob('*'):
+                        if _stop_evt.is_set(): break
+                        if item.is_file() and item.suffix.lower() in selected_exts:
+                            local_files.append(item)
+
+                    if _stop_evt.is_set():
+                        _log("⛔ Interrompido.", "warn")
+                        win.after(0, _finish_buttons)
+                        return
+
+                    # Mini resumo por mês/ano
+                    by_month = defaultdict(list)
+                    for f in local_files:
+                        key, label = self._mtime_label(f)
+                        by_month[key].append((f, label))
+
+                    _log(f"Total de fotos na pasta local: {len(local_files)}")
+                    _log("")
+                    _log("Distribuição por data de modificação:")
+                    for (yr, mo) in sorted(by_month.keys(), reverse=True):
+                        ents  = by_month[(yr, mo)]
+                        label = ents[0][1]
+                        _log(f"  • {len(ents):>4} foto(s) em {label}", "ok")
+                    _log("")
+
+                    # ETAPA 2 — indexar Drive
+                    _log("=" * 62, "hdr")
+                    _log("ETAPA 2 — Indexando fotos no Drive", "hdr")
+                    _log("=" * 62, "hdr")
+                    win.after(0, lambda: status_var.set("Indexando Drive..."))
+
+                    drive_index = {}
+                    for item in drive_path.rglob('*'):
+                        if _stop_evt.is_set(): break
+                        if item.is_file() and item.suffix.lower() in selected_exts:
+                            win.after(0, lambda n=item.name: status_var.set(f"Drive: {n}"))
+                            key = _photo_key(item)
+                            drive_index.setdefault(key, []).append(item)
+
+                    if _stop_evt.is_set():
+                        _log("⛔ Interrompido.", "warn")
+                        win.after(0, _finish_buttons)
+                        return
+
+                    _log(f"Total de fotos indexadas no Drive: {len(drive_index)}")
+                    _log("")
+
+                    # ETAPA 3 — comparação
+                    _log("=" * 62, "hdr")
+                    _log("ETAPA 3 — Comparando com o Drive", "hdr")
+                    _log("=" * 62, "hdr")
+                    win.after(0, lambda: status_var.set("Comparando..."))
+
+                    matched   = []
+                    unmatched = []
+
+                    for item in local_files:
+                        if _stop_evt.is_set(): break
+                        win.after(0, lambda n=item.name: status_var.set(f"Verificando: {n}"))
+                        key = _photo_key(item)
+                        if key in drive_index:
+                            matched_drv    = drive_index[key][0]
+                            rel_drive_path = matched_drv.relative_to(drive_path)
+                            target         = mirror_path / rel_drive_path
+                            _pending.append((item, target))
+                            tree.after(0, lambda l=str(item), d=str(target):
+                                       tree.insert("", tk.END, values=(l, d)))
+                            matched.append(item)
+                        else:
+                            unmatched.append(item)
+
+                    _log(f"  ✓ Com correspondência:    {len(matched):>4} → prontos para mover", "ok")
+                    _log(f"  ✗ SEM correspondência:    {len(unmatched):>4}", "warn")
+                    _log("")
+
+                    # ETAPA 4 — sem sincronismo
+                    _log("=" * 62, "hdr")
+                    _log("ETAPA 4 — Fotos SEM Sincronismo", "hdr")
+                    _log("=" * 62, "hdr")
+                    if unmatched:
+                        um_by_month = defaultdict(list)
+                        for f in unmatched:
+                            key, label = self._mtime_label(f)
+                            um_by_month[key].append((f, label))
+                        for (yr, mo) in sorted(um_by_month.keys(), reverse=True):
+                            ents  = um_by_month[(yr, mo)]
+                            label = ents[0][1]
+                            _log(f"  • {len(ents):>4} foto(s) sem sincronismo em {label}", "warn")
+                    else:
+                        _log("  ✓ Todas as fotos foram encontradas no Drive!", "ok")
+
+                    _log("")
+                    _log("=" * 62, "hdr")
+
+                    win.after(0, lambda: status_var.set(
+                        f"Análise concluída: {len(matched)} prontos para mover  |  "
+                        f"{len(unmatched)} sem correspondência."
+                    ))
+                    win.after(0, lambda: btn_move.config(
+                        state="normal" if _pending else "disabled"))
+
+                except Exception as e:
+                    _log(f"ERRO: {e}", "err")
+                    win.after(0, lambda: status_var.set(f"Erro: {e}"))
+                finally:
+                    win.after(0, _finish_buttons)
+
+            threading.Thread(target=_thread, daemon=True).start()
+
+        def _finish_buttons():
+            btn_analyze.config(state="normal")
+            btn_stop.config(state="disabled")
+
+        def _stop():
+            _stop_evt.set()
+            status_var.set("Interrompendo...")
+            btn_stop.config(state="disabled")
+            _log("⛔ Análise interrompida pelo usuário.", "warn")
+
+        def _run_move():
+            if not _pending:
+                status_var.set("Nenhum arquivo na fila.")
+                return
+            btn_move.config(state="disabled")
+            btn_analyze.config(state="disabled")
+            status_var.set(f"Movendo {len(_pending)} foto(s)...")
+
+            def _thread():
+                moved  = 0
+                failed = 0
+                total  = len(_pending)
+                for i, (src, dst) in enumerate(list(_pending), 1):
+                    try:
+                        win.after(0, lambda n=src.name, idx=i:
+                                  status_var.set(f"[{idx}/{total}] Movendo: {n}"))
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        s, d = str(src), str(dst)
+                        if len(s) >= 256 and not s.startswith("\\\\?\\"):
+                            s = "\\\\?\\" + s
+                        if len(d) >= 256 and not d.startswith("\\\\?\\"):
+                            d = "\\\\?\\" + d
+                        ok, info = _try_move(s, d)
+                        if ok:
+                            moved += 1
+                            if info == "cross-device":
+                                _log(f"  ⚠ Copiado (drives diferentes): {src.name}", "warn")
+                        else:
+                            _log(f"  ✗ FALHA: {src.name}", "err")
+                            _log(f"      Motivo: {info}", "err")
+                            _log(f"      SRC: {s}", "err")
+                            _log(f"      DST: {d}", "err")
+                            failed += 1
+                    except Exception as ex:
+                        _log(f"  ✗ Exceção: {src.name} — {ex}", "err")
+                        failed += 1
+                _pending.clear()
+                msg = f"✓ {moved} foto(s) movida(s)." + (f"  ✗ {failed} falha(s)." if failed else "")
+                win.after(0, lambda: status_var.set(msg))
+                win.after(0, lambda: btn_analyze.config(state="normal"))
+                _log(f"\n{msg}", "ok" if not failed else "warn")
+
+            threading.Thread(target=_thread, daemon=True).start()
+
+        btn_analyze.config(command=_run_analysis)
+        btn_stop.config(command=_stop)
+        btn_move.config(command=_run_move)
 
     # ================================================================
     # Limpeza FX3 — arquivos auxiliares
@@ -689,23 +1155,33 @@ class DriveOrganizerApp:
             if not ok:
                 return
 
-            deleted = 0
-            failed  = 0
+            # Coleta todos os arquivos dos grupos selecionados
+            all_files = []
             for key in selected_keys:
-                for fpath in groups[key]:
-                    try:
-                        if _send_to_trash(str(fpath)):
-                            deleted += 1
-                        else:
-                            failed += 1
-                    except Exception as ex:
-                        failed += 1
-                        status_var.set(f"Erro: {fpath.name}: {ex}")
+                all_files.extend(groups[key])
 
-            status_var.set(f"✓ {deleted} arquivo(s) enviado(s) para a Lixeira" +
-                           (f"  |  ✗ {failed} falha(s)" if failed else ""))
-            # Re-escaneia para atualizar a lista
-            _do_scan()
+            # Desabilita botões durante a operação
+            btn_delete.config(state="disabled")
+            btn_scan.config(state="disabled")
+            status_var.set(f"Enviando {len(all_files)} arquivo(s) para a Lixeira...")
+
+            def _run_in_thread():
+                try:
+                    success = _send_to_trash(all_files)  # UMA chamada batch — Windows mostra progress
+                    if success:
+                        msg = f"✓ {len(all_files)} arquivo(s) enviado(s) para a Lixeira."
+                    else:
+                        msg = f"✗ Falha ao enviar para a Lixeira (verifique permissões)."
+                except Exception as ex:
+                    msg = f"Erro: {ex}"
+                finally:
+                    # Atualiza UI e re-escaneia (sempre na thread principal)
+                    win.after(0, lambda: status_var.set(msg))
+                    win.after(0, lambda: btn_delete.config(state="normal"))
+                    win.after(0, lambda: btn_scan.config(state="normal"))
+                    win.after(100, _do_scan)
+
+            threading.Thread(target=_run_in_thread, daemon=True).start()
 
         btn_scan.config(command=_do_scan)
         btn_delete.config(command=_do_delete)
@@ -725,28 +1201,40 @@ class DriveOrganizerApp:
         threading.Thread(target=self._mirror_process, daemon=True).start()
 
     def _mirror_process(self):
-        moved = 0
+        moved  = 0
+        failed = 0
         try:
-            for src_path, dest_path in self.pending_moves:
-                self.update_status(f"Movendo: {src_path.name}", "#28a745")
+            total = len(self.pending_moves)
+            for i, (src_path, dest_path) in enumerate(self.pending_moves, 1):
+                self.update_status(f"[{i}/{total}] Movendo: {src_path.name}", "#28a745")
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
 
                 src_str = str(src_path)
                 dst_str = str(dest_path)
-
                 if len(src_str) >= 256 and not src_str.startswith("\\\\?\\"):
                     src_str = "\\\\?\\" + src_str
                 if len(dst_str) >= 256 and not dst_str.startswith("\\\\?\\"):
                     dst_str = "\\\\?\\" + dst_str
 
-                if ctypes.windll.kernel32.MoveFileW(src_str, dst_str):
+                ok, info = _try_move(src_str, dst_str)
+                if ok:
                     moved += 1
+                    if info == "cross-device":
+                        self.log(f"  ⚠ Copiado (drives diferentes): {src_path.name}")
                 else:
-                    self.log(f"  ✗ Falha ao mover: {src_str}")
+                    self.log(f"  ✗ FALHA: {src_path.name}")
+                    self.log(f"      Motivo: {info}")
+                    self.log(f"      SRC: {src_str}")
+                    self.log(f"      DST: {dst_str}")
+                    failed += 1
 
             self.pending_moves.clear()
-            self.update_status(f"Concluído! {moved} arquivo(s) MP4 movido(s).", "#28a745")
-            self.log(f"\n✓ {moved} arquivo(s) movido(s) com sucesso.")
+            cor = "#28a745" if not failed else "#FF8C00"
+            self.update_status(
+                f"Concluído! {moved} movido(s)" + (f" | {failed} falha(s)" if failed else "."),
+                cor)
+            self.log(f"\n✓ {moved} arquivo(s) movido(s)." +
+                     (f"  ✗ {failed} falha(s)." if failed else ""))
 
         except Exception as e:
             self.update_status(f"Erro ao mover: {str(e)}", "red")
